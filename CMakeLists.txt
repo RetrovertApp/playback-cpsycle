@@ -10,7 +10,7 @@ project(playback_cpsycle C)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(PlaybackPlugin)
 
-find_package(ZLIB REQUIRED)
+add_subdirectory(external/zlib)
 
 # Download pre-patched cpsycle library (cross-platform fixes already applied)
 download_library(
