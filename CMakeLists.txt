@@ -12,6 +12,12 @@ include(PlaybackPlugin)
 
 add_subdirectory(external/zlib)
 
+# Make vendored zlib visible to cpsycle-lib's find_package(ZLIB)
+set(ZLIB_FOUND TRUE)
+set(ZLIB_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/zlib" CACHE PATH "" FORCE)
+set(ZLIB_LIBRARY zlib_static CACHE STRING "" FORCE)
+set(ZLIB_LIBRARIES zlib_static)
+
 # Download pre-patched cpsycle library (cross-platform fixes already applied)
 download_library(
     NAME cpsycle
