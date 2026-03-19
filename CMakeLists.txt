@@ -63,7 +63,7 @@ target_link_libraries(cpsycle_playback PRIVATE
     cpsycle_file
     cpsycle_thread
     cpsycle_container
-    ZLIB::ZLIB
+    zlib_static
 )
 
 if(UNIX)
