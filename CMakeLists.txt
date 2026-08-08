@@ -37,6 +37,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
         -Wno-int-conversion
         -Wno-implicit-function-declaration
     )
+elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND
+       CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
+    # GCC 14+ promotes several legacy C diagnostics to errors by default.
+    set(CPSYCLE_EXTRA_C_FLAGS -fpermissive)
 endif()
 
 foreach(tgt cpsycle_container cpsycle_file cpsycle_thread cpsycle_dsp cpsycle_audio)
