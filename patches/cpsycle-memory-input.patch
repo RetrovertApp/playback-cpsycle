@@ -1,0 +1,250 @@
+diff --git a/audio/src/songio.c b/audio/src/songio.c
+--- a/audio/src/songio.c
++++ b/audio/src/songio.c
+@@ -72,7 +72,8 @@ void psy_audio_songfile_dispose(psy_audio_SongFile* self)
+ 	psy_signal_dispose(&self->signal_warning);		
+ }
+ 
+-int psy_audio_songfile_load(psy_audio_SongFile* self, const char* filename)
++static int psy_audio_songfile_load_internal(psy_audio_SongFile* self,
++	const char* filename, const void* data, uintptr_t size)
+ {		
+ 	PsyFile file;
+ 	int status;
+@@ -87,7 +88,8 @@ int psy_audio_songfile_load(psy_audio_SongFile* self, const char* filename)
+ 	psy_audio_songfile_message(self, "searching for ");
+ 	psy_audio_songfile_message(self, self->path);
+ 	psy_audio_songfile_message(self, "\n");
+-	if (psyfile_open(self->file, filename)) {
++	if ((data != NULL && psyfile_open_memory(self->file, data, size, filename)) ||
++		(data == NULL && psyfile_open(self->file, filename))) {
+ 		char header[20];
+ 		char riff[5];
+ 		
+@@ -191,6 +193,18 @@ int psy_audio_songfile_load(psy_audio_SongFile* self, const char* filename)
+ 	return status;
+ }
+ 
++int psy_audio_songfile_load(psy_audio_SongFile* self, const char* filename)
++{
++	return psy_audio_songfile_load_internal(self, filename, NULL, 0);
++}
++
++int psy_audio_songfile_load_memory(psy_audio_SongFile* self, const void* data,
++	uintptr_t size, const char* filename)
++{
++	return psy_audio_songfile_load_internal(self,
++		filename ? filename : "<memory>", data, size);
++}
++
+ int psy_audio_songfile_save(psy_audio_SongFile* self, const char* filename)
+ {		
+ 	int status;
+diff --git a/audio/src/songio.h b/audio/src/songio.h
+--- a/audio/src/songio.h
++++ b/audio/src/songio.h
+@@ -46,6 +46,8 @@ void psy_audio_songfile_init(psy_audio_SongFile*);
+ void psy_audio_songfile_init_song(psy_audio_SongFile*, struct psy_audio_Song*);
+ void psy_audio_songfile_dispose(psy_audio_SongFile*);
+ int psy_audio_songfile_load(psy_audio_SongFile*, const char* filename);
++int psy_audio_songfile_load_memory(psy_audio_SongFile*, const void* data,
++	uintptr_t size, const char* filename);
+ int psy_audio_songfile_save(psy_audio_SongFile*, const char* filename);
+ int psy_audio_songfile_exportmodule(psy_audio_SongFile*, const char* filename);
+ int psy_audio_songfile_export_midi_file(psy_audio_SongFile*, const char* filename);
+diff --git a/file/src/fileio.c b/file/src/fileio.c
+--- a/file/src/fileio.c
++++ b/file/src/fileio.c
+@@ -36,13 +36,38 @@ uint32_t FourCC(char *psName)
+ int psyfile_open(PsyFile* self, const char* filename)
+ {
+ 	strcpy(self->szName, filename);
++	self->_memory = NULL;
++	self->_memory_size = 0;
++	self->_memory_pos = 0;
++	self->_memory_error = 0;
+ 	self->_file = fopen(filename, "rb");
+ 	return (self->_file != NULL);
+ }
+ 
++int psyfile_open_memory(PsyFile* self, const void* data, uintptr_t size,
++	const char* filename)
++{
++	if (data == NULL) {
++		return 0;
++	}
++	strncpy(self->szName, filename ? filename : "<memory>",
++		sizeof(self->szName) - 1);
++	self->szName[sizeof(self->szName) - 1] = '\0';
++	self->_file = NULL;
++	self->_memory = (const uint8_t*)data;
++	self->_memory_size = size;
++	self->_memory_pos = 0;
++	self->_memory_error = 0;
++	return 1;
++}
++
+ int psyfile_create(PsyFile* self, const char* filename, bool overwrite)
+ {	
+ 	strcpy(self->szName, filename);
++	self->_memory = NULL;
++	self->_memory_size = 0;
++	self->_memory_pos = 0;
++	self->_memory_error = 0;
+ 	self->_file = fopen(filename, "rb");
+ 	if (self->_file != NULL)
+ 	{
+@@ -58,6 +83,12 @@ int psyfile_create(PsyFile* self, const char* filename, bool overwrite)
+ 
+ int psyfile_close(PsyFile* self)
+ {
++	if (self->_memory != NULL) {
++		int ok = !self->_memory_error;
++		self->_memory = NULL;
++		self->_memory_size = self->_memory_pos = 0;
++		return ok;
++	}
+ 	if ( self->_file != NULL ) {
+ 		int b;
+ 		fflush(self->_file);
+@@ -73,6 +104,15 @@ int psyfile_read(PsyFile* self,
+ 				 void* pData,
+ 				 uintptr_t numBytes)
+ {
++	if (self->_memory != NULL) {
++		if (numBytes > self->_memory_size - self->_memory_pos) {
++			self->_memory_error = 1;
++			return PSY_ERRFILE;
++		}
++		memcpy(pData, self->_memory + self->_memory_pos, numBytes);
++		self->_memory_pos += numBytes;
++		return PSY_OK;
++	}
+ 	uintptr_t bytesRead = fread(pData, sizeof(char), numBytes, self->_file);
+ 	return (bytesRead == numBytes) ? PSY_OK : PSY_ERRFILE;	
+ }
+@@ -82,6 +122,10 @@ int psyfile_write(PsyFile* self, const void* data, uintptr_t numbytes)
+ 	uintptr_t byteswritten;
+ 	int status;
+ 
++	if (self->_memory != NULL) {
++		self->_memory_error = 1;
++		return PSY_ERRFILE;
++	}
+ 	fflush(self->_file);
+ 	byteswritten = fwrite(data, sizeof(char), numbytes, self->_file);
+ 	status = (byteswritten == numbytes) ? PSY_OK : PSY_ERRFILE;
+@@ -131,7 +175,11 @@ int psyfile_expect(PsyFile* self,
+ 	
+ 	while (numBytes-- != 0)
+ 	{
+-		if (fread(&c, sizeof(c), 1, self->_file) != 1)
++		if (self->_memory != NULL) {
++			if (psyfile_read(self, &c, 1) != PSY_OK) {
++				return 0;
++			}
++		} else if (fread(&c, sizeof(c), 1, self->_file) != 1)
+ 		{
+ 			return 0;
+ 		}
+@@ -147,6 +195,14 @@ int psyfile_expect(PsyFile* self,
+ int32_t psyfile_seek(PsyFile* self,
+ 				   uint32_t offset)
+ {
++	if (self->_memory != NULL) {
++		if ((uintptr_t)offset > self->_memory_size) {
++			self->_memory_error = 1;
++			return -1;
++		}
++		self->_memory_pos = offset;
++		return (int32_t)offset;
++	}
+ 	if (fseek(self->_file, (int32_t)offset, SEEK_SET) != 0)
+ 	{
+ 		return -1;
+@@ -158,6 +214,14 @@ int32_t psyfile_seek(PsyFile* self,
+ int32_t psyfile_skip(PsyFile* self,
+ 				   uint32_t numBytes)
+ {
++	if (self->_memory != NULL) {
++		if ((uintptr_t)numBytes > self->_memory_size - self->_memory_pos) {
++			self->_memory_error = 1;
++			return -1;
++		}
++		self->_memory_pos += numBytes;
++		return (int32_t)self->_memory_pos;
++	}
+ 	if (fseek(self->_file, (int32_t)numBytes, SEEK_CUR) != 0)
+ 	{
+ 		return -1;
+@@ -167,17 +231,26 @@ int32_t psyfile_skip(PsyFile* self,
+ 
+ int psyfile_eof(PsyFile* self)
+ {
++	if (self->_memory != NULL) {
++		return self->_memory_pos >= self->_memory_size;
++	}
+ 	return feof(self->_file);	
+ }
+ 
+ uint32_t psyfile_getpos(PsyFile* self)
+ {
++	if (self->_memory != NULL) {
++		return (uint32_t)self->_memory_pos;
++	}
+ 	return ftell(self->_file);
+ }
+ 
+ 
+ uint32_t psyfile_filesize(PsyFile* self)
+ {	
++	if (self->_memory != NULL) {
++		return (uint32_t)self->_memory_size;
++	}
+ 	int32_t init = ftell(self->_file);
+ 	int32_t end;
+ 	fseek(self->_file, 0,SEEK_END);
+@@ -218,6 +291,9 @@ int psyfile_readstring(PsyFile* self, char* pData, uint32_t maxBytes)
+ 
+ FILE* psyfile_getfile(PsyFile* self)
+ {
++	if (self->_memory != NULL) {
++		return NULL;
++	}
+ 	return self->_file;
+ }
+ 
+@@ -286,6 +362,9 @@ void psyfile_seekchunkend(PsyFile* self)
+ 
+ int psyfile_error(PsyFile* self)
+ {
++	if (self->_memory != NULL) {
++		return self->_memory_error;
++	}
+ 	return ferror(self->_file);
+ }
+ 
+diff --git a/file/src/fileio.h b/file/src/fileio.h
+--- a/file/src/fileio.h
++++ b/file/src/fileio.h
+@@ -32,7 +32,11 @@ typedef struct {
+ typedef struct PsyFile {	
+ 	int _modified;
+ 	char szName[1024];
+-	FILE* _file;	
++	FILE* _file;
++	const uint8_t* _memory;
++	uintptr_t _memory_size;
++	uintptr_t _memory_pos;
++	int _memory_error;
+ 	RiffChunk currchunk;
+ 	uint32_t fileversion;
+ 	uint32_t filesize;
+@@ -41,6 +45,7 @@ typedef struct PsyFile {
+ } PsyFile; 
+ 
+ int psyfile_open(PsyFile*, const char* filename);
++int psyfile_open_memory(PsyFile*, const void* data, uintptr_t size, const char* filename);
+ int psyfile_create(PsyFile*, const char* filename, bool overwrite);
+ int psyfile_close(PsyFile*);
+ int psyfile_read(PsyFile*, void* data, uintptr_t numbytes);

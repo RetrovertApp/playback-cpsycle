@@ -30,17 +30,9 @@
 #include "song.h"
 #include "songio.h"
 
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include <io.h>
-#define strcasecmp _stricmp
-#else
-#include <strings.h>
-#include <unistd.h>
-#endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -61,7 +53,6 @@ typedef struct CpsycleReplayerData {
     psy_audio_PluginCatcher plugincatcher;
     int initialized;
     int song_ended;
-    char temp_path[512];
 } CpsycleReplayerData;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -116,64 +107,6 @@ static RVProbeResult cpsycle_plugin_probe_can_play(uint8_t* probe_data, uint64_t
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Write memory buffer to a temporary file and return path.
-// cpsycle's song loader requires a filesystem path - this avoids patching its file I/O.
-
-static int write_temp_file(CpsycleReplayerData* data, const uint8_t* buf, uint64_t size) {
-#ifdef _WIN32
-    char temp_dir[256];
-    DWORD len = GetTempPathA(sizeof(temp_dir), temp_dir);
-    if (len == 0 || len >= sizeof(temp_dir)) {
-        return -1;
-    }
-    snprintf(data->temp_path, sizeof(data->temp_path), "%scpsycle_XXXXXX", temp_dir);
-    int fd = _mktemp_s(data->temp_path, sizeof(data->temp_path));
-    if (fd != 0) {
-        return -1;
-    }
-    FILE* f = fopen(data->temp_path, "wb");
-    if (f == nullptr) {
-        return -1;
-    }
-#else
-    snprintf(data->temp_path, sizeof(data->temp_path), "/tmp/cpsycle_XXXXXX");
-    int fd = mkstemp(data->temp_path);
-    if (fd < 0) {
-        return -1;
-    }
-    FILE* f = fdopen(fd, "wb");
-    if (f == nullptr) {
-        close(fd);
-        return -1;
-    }
-#endif
-
-    size_t written = fwrite(buf, 1, (size_t)size, f);
-    fclose(f);
-
-    if (written != (size_t)size) {
-        unlink(data->temp_path);
-        data->temp_path[0] = '\0';
-        return -1;
-    }
-
-    return 0;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static void cleanup_temp_file(CpsycleReplayerData* data) {
-    if (data->temp_path[0] != '\0') {
-#ifdef _WIN32
-        _unlink(data->temp_path);
-#else
-        unlink(data->temp_path);
-#endif
-        data->temp_path[0] = '\0';
-    }
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static int cpsycle_plugin_open(void* user_data, const char* url, uint32_t subsong, const RVService* service_api) {
     (void)service_api;
@@ -187,15 +120,11 @@ static int cpsycle_plugin_open(void* user_data, const char* url, uint32_t subson
         rv_error("cpsycle: Failed to load %s to memory", url);
         return -1;
     }
-
-    // Write to temp file (cpsycle needs a filesystem path)
-    if (write_temp_file(data, read_res.data, read_res.data_size) != 0) {
-        rv_error("cpsycle: Failed to create temp file for %s", url);
+    if (read_res.data_size > (uint64_t)UINTPTR_MAX) {
+        rv_error("cpsycle: Song is too large to load on this platform: %s", url);
         rv_io_free_url_to_memory(read_res.data);
         return -1;
     }
-
-    rv_io_free_url_to_memory(read_res.data);
 
     // Initialize the audio subsystem
     psy_audio_init();
@@ -221,7 +150,7 @@ static int cpsycle_plugin_open(void* user_data, const char* url, uint32_t subson
         psy_audio_machinefactory_dispose(&data->machinefactory);
         psy_audio_plugincatcher_dispose(&data->plugincatcher);
         psy_audio_dispose();
-        cleanup_temp_file(data);
+        rv_io_free_url_to_memory(read_res.data);
         return -1;
     }
 
@@ -231,8 +160,10 @@ static int cpsycle_plugin_open(void* user_data, const char* url, uint32_t subson
     psy_audio_SongFile songfile;
     psy_audio_songfile_init(&songfile);
     songfile.song = data->song;
-    int err = psy_audio_songfile_load(&songfile, data->temp_path);
+    int err = psy_audio_songfile_load_memory(
+        &songfile, read_res.data, (uintptr_t)read_res.data_size, url);
     psy_audio_songfile_dispose(&songfile);
+    rv_io_free_url_to_memory(read_res.data);
 
     if (err != PSY_OK) {
         rv_error("cpsycle: Failed to load song %s (error %d)", url, err);
@@ -242,7 +173,6 @@ static int cpsycle_plugin_open(void* user_data, const char* url, uint32_t subson
         psy_audio_machinefactory_dispose(&data->machinefactory);
         psy_audio_plugincatcher_dispose(&data->plugincatcher);
         psy_audio_dispose();
-        cleanup_temp_file(data);
         return -1;
     }
 
@@ -263,9 +193,6 @@ static int cpsycle_plugin_open(void* user_data, const char* url, uint32_t subson
 
     data->initialized = 1;
     data->song_ended = 0;
-
-    // Clean up temp file now that song is loaded
-    cleanup_temp_file(data);
 
     return 0;
 }
@@ -291,7 +218,6 @@ static void cpsycle_plugin_close(void* user_data) {
     psy_audio_plugincatcher_dispose(&data->plugincatcher);
     psy_audio_dispose();
 
-    cleanup_temp_file(data);
     data->initialized = 0;
 }
 

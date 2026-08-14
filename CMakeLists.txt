@@ -7,6 +7,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(playback_cpsycle C)
 
+include(CTest)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(PlaybackPlugin)
 
@@ -25,6 +27,8 @@ download_library(
     FILENAME "cpsycle-lib-9187443880a6f315885675102e97ffec6e7ebb04.tar.gz"
     HASH "f08752029bcebf5dd695cab20dc3a408482596cb671e456e2d36901cccb44ef5"
     EXTRACT_DIR "cpsycle-lib-9187443880a6f315885675102e97ffec6e7ebb04"
+    PATCHES
+        patches/cpsycle-memory-input.patch
 )
 
 # Build cpsycle static libraries via its own CMakeLists.txt
@@ -79,3 +83,11 @@ if(UNIX AND NOT APPLE)
 endif()
 
 rv_set_plugin_properties(cpsycle_playback)
+
+if(BUILD_TESTING)
+    add_executable(cpsycle_memory_input_test
+        tests/cpsycle_memory_input_test.c
+    )
+    target_link_libraries(cpsycle_memory_input_test PRIVATE cpsycle_file)
+    add_test(NAME cpsycle_memory_input COMMAND cpsycle_memory_input_test)
+endif()
