@@ -236,7 +236,8 @@ static RVReadInfo cpsycle_plugin_read_data(void* user_data, RVReadData dest) {
     }
 
     // Calculate how many frames we can generate
-    uint32_t max_frames = dest.channels_output_max_bytes_size / (sizeof(float) * 2);
+    uint32_t capacity_frames = dest.channels_output_max_bytes_size / (sizeof(float) * 2);
+    uint32_t max_frames = dest.info.frame_count < capacity_frames ? dest.info.frame_count : capacity_frames;
     if (max_frames > RENDER_BLOCK_SIZE) {
         max_frames = RENDER_BLOCK_SIZE;
     }

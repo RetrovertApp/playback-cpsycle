@@ -1,0 +1,9 @@
+[plugin]
+name = "cpsycle"
+
+[data]
+entries = []
+
+[[fixtures]]
+file = "fixtures/Demosong - Oldstyle.psy"
+sha256 = "a656f0efda11bce598e7fbb6d41032b9c96937cfd80ced89155c23730c8a25df"
