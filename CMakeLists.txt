@@ -29,6 +29,7 @@ download_library(
     EXTRACT_DIR "cpsycle-lib-9187443880a6f315885675102e97ffec6e7ebb04"
     PATCHES
         patches/cpsycle-memory-input.patch
+        patches/cpsycle-no-win32-ui.patch
 )
 
 # Build cpsycle static libraries via its own CMakeLists.txt

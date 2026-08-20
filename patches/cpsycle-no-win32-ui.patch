@@ -1,0 +1,38 @@
+diff --git a/audio/src/cmddriver.c b/audio/src/cmddriver.c
+--- a/audio/src/cmddriver.c
++++ b/audio/src/cmddriver.c
+@@ -94,13 +94,8 @@
+ /* implementation */
+ int onerror(int err, const char* msg)
+ {
+-#if defined DIVERSALIS__OS__MICROSOFT    
+-	MessageBox(0, msg, "cmd driver", MB_OK | MB_ICONERROR);
+-	return 0;
+-#else
+     fprintf(stderr, "cmd driver %s", msg);
+ 	return 0;
+-#endif    
+ }
+ 
+ void psy_audio_cmddriver_setcmd(psy_EventDriver* driver, const char* section, psy_EventDriverCmd cmd)
+diff --git a/file/src/dir.c b/file/src/dir.c
+--- a/file/src/dir.c
++++ b/file/src/dir.c
+@@ -682,7 +682,7 @@
+ const char* psy_dir_config(void)
+ {
+ 	static TCHAR achDevice[MAX_PATH];	
+-#if WINVER >= 0x600
++#if 0  /* SHGetFolderPath pulls shell32; release payloads import core OS only */
+ 	HRESULT  hr;
+ 	/*
+ 	** include file ShlObj.h contains list of CSIDL defines however only a subset
+@@ -707,7 +707,7 @@
+ const char* psy_dir_home(void)
+ {
+ 	static TCHAR achDevice[MAX_PATH];
+-#if WINVER >= 0x600
++#if 0  /* SHGetFolderPath pulls shell32; release payloads import core OS only */
+ 	HRESULT  hr;
+ 	/*
+ 	** include file ShlObj.h contains list of CSIDL defines however only a
