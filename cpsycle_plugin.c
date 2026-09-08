@@ -29,7 +29,11 @@
 #include "silentdriver.h"
 #include "song.h"
 #include "songio.h"
+#include "notestab.h"
+#include "sequenceselection.h"
 
+#include <stdio.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +42,17 @@
 
 #define OUTPUT_SAMPLE_RATE 48000
 #define RENDER_BLOCK_SIZE 2048
+
+// Note, instrument, machine, volume, command, parameter -- the six fields a
+// Psycle pattern cell carries.
+#define CPSYCLE_COLUMN_COUNT 6
+// The host caps a pattern channel count at 64 and, by default, a captured
+// window at 64 rows. Both are clamped here rather than reported past the limit,
+// which the host treats as an error rather than as something to truncate.
+#define CPSYCLE_MAX_PATTERN_CHANNELS 64
+#define CPSYCLE_ROW_WINDOW 64
+// Psycle plays a multi-sequence; only the first sequence track is followed.
+#define CPSYCLE_SEQUENCE_TRACK 0
 
 RV_PLUGIN_USE_IO_API();
 RV_PLUGIN_USE_METADATA_API();
@@ -325,6 +340,332 @@ static void cpsycle_plugin_static_init(const RVService* service_api) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Visualization.
+//
+// Psycle is a tracker, so what it has to show is the pattern grid rather than a
+// scope. Its patterns are not row arrays: a pattern is a list of entries each
+// carrying a beat offset and a track, so a row is recovered by multiplying the
+// offset by the sequencer's lines per beat. The playing pattern is found by
+// asking the sequence which order entry covers the current beat position.
+
+static psy_audio_Sequence* cpsycle_sequence(CpsycleReplayerData* data) {
+    if (data == nullptr || data->song == nullptr) {
+        return nullptr;
+    }
+    return psy_audio_song_sequence(data->song);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Resolve the order entry, pattern and row the player is currently on.
+// Returns false when the song is not positioned on a pattern.
+
+static bool cpsycle_current_location(CpsycleReplayerData* data, uintptr_t* out_order, psy_audio_Pattern** out_pattern,
+                                     uintptr_t* out_pattern_index, uint32_t* out_row, uint32_t* out_rows) {
+    psy_audio_Sequence* sequence = cpsycle_sequence(data);
+    if (sequence == nullptr) {
+        return false;
+    }
+
+    uintptr_t lpb = psy_audio_sequencer_lpb(&data->player.sequencer);
+    if (lpb == 0) {
+        return false;
+    }
+
+    psy_dsp_big_beat_t position = psy_audio_player_position(&data->player);
+    uintptr_t order = psy_audio_sequence_order(sequence, CPSYCLE_SEQUENCE_TRACK, position);
+    psy_audio_OrderIndex index = psy_audio_orderindex_make(CPSYCLE_SEQUENCE_TRACK, order);
+
+    psy_audio_Pattern* pattern = psy_audio_sequence_pattern(sequence, index);
+    if (pattern == nullptr) {
+        return false;
+    }
+
+    psy_dsp_big_beat_t entry_offset = psy_audio_sequence_offset(sequence, index);
+    psy_dsp_big_beat_t in_pattern = position - entry_offset;
+    if (in_pattern < (psy_dsp_big_beat_t)0.0) {
+        in_pattern = (psy_dsp_big_beat_t)0.0;
+    }
+
+    double rows = (double)psy_audio_pattern_length(pattern) * (double)lpb;
+    if (rows < 1.0) {
+        rows = 1.0;
+    }
+
+    uint32_t row = (uint32_t)((double)in_pattern * (double)lpb);
+    if ((double)row >= rows) {
+        row = (uint32_t)rows - 1;
+    }
+
+    *out_order = order;
+    *out_pattern = pattern;
+    *out_pattern_index = psy_audio_sequence_patternindex(sequence, index);
+    *out_row = row;
+    *out_rows = (uint32_t)rows;
+    return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t cpsycle_pattern_channels(CpsycleReplayerData* data) {
+    if (data == nullptr || data->song == nullptr) {
+        return 0;
+    }
+
+    uintptr_t tracks = psy_audio_song_numsongtracks(data->song);
+    if (tracks > CPSYCLE_MAX_PATTERN_CHANNELS) {
+        tracks = CPSYCLE_MAX_PATTERN_CHANNELS;
+    }
+    return (uint32_t)tracks;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static bool cpsycle_plugin_get_structure(void* user_data, RVVizInfo* out) {
+    CpsycleReplayerData* data = (CpsycleReplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return false;
+    }
+
+    uint32_t channels = cpsycle_pattern_channels(data);
+    if (channels == 0) {
+        return false;
+    }
+
+    // The whole song is loaded up front and its rows never change as it plays.
+    out->caps = RVVizCaps_PatternCells | RVVizCaps_WholeSongKnown | RVVizCaps_SeekablePreview | RVVizCaps_FutureKnown;
+    out->scroll_mode = RVScrollMode_Synchronized;
+    out->pattern_channel_count = channels;
+    out->scope_channel_count = 0;
+    out->column_count = CPSYCLE_COLUMN_COUNT;
+    return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t cpsycle_plugin_get_columns(void* user_data, RVColumnDesc* out, uint32_t cap) {
+    (void)user_data;
+    static const struct {
+        const char* label;
+        uint8_t width;
+        RVColumnKind kind;
+    } s_columns[CPSYCLE_COLUMN_COUNT] = {
+        { "Note", 3, RVColumnKind_Note },  { "Inst", 2, RVColumnKind_Instrument },
+        { "Mac", 2, RVColumnKind_Custom }, { "Vol", 2, RVColumnKind_Volume },
+        { "Cmd", 2, RVColumnKind_Effect }, { "Prm", 2, RVColumnKind_Param },
+    };
+
+    if (out == nullptr) {
+        return 0;
+    }
+
+    uint32_t count = cap < CPSYCLE_COLUMN_COUNT ? cap : CPSYCLE_COLUMN_COUNT;
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].label, 0, sizeof(out[i].label));
+        snprintf((char*)out[i].label, sizeof(out[i].label), "%s", s_columns[i].label);
+        out[i].char_width = s_columns[i].width;
+        out[i].kind = s_columns[i].kind;
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t cpsycle_plugin_get_pattern_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    CpsycleReplayerData* data = (CpsycleReplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return 0;
+    }
+
+    uint32_t channels = cpsycle_pattern_channels(data);
+    uint32_t count = channels < cap ? channels : cap;
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        snprintf((char*)out[i].name, sizeof(out[i].name), "Track %u", i + 1);
+        out[i].scope_width = 0;
+    }
+    return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static bool cpsycle_plugin_get_position(void* user_data, RVTrackerPosition* out) {
+    CpsycleReplayerData* data = (CpsycleReplayerData*)user_data;
+    if (data == nullptr || out == nullptr) {
+        return false;
+    }
+
+    uintptr_t order = 0;
+    uintptr_t pattern_index = 0;
+    psy_audio_Pattern* pattern = nullptr;
+    uint32_t row = 0;
+    uint32_t rows = 0;
+    if (!cpsycle_current_location(data, &order, &pattern, &pattern_index, &row, &rows)) {
+        return false;
+    }
+
+    // A pattern can be longer than the host's row budget, so the window follows
+    // the playhead instead of spanning the whole pattern.
+    uint32_t lo = 0;
+    uint32_t hi = rows;
+    if (rows > CPSYCLE_ROW_WINDOW) {
+        lo = row > (CPSYCLE_ROW_WINDOW / 2) ? row - (CPSYCLE_ROW_WINDOW / 2) : 0;
+        if (lo + CPSYCLE_ROW_WINDOW > rows) {
+            lo = rows - CPSYCLE_ROW_WINDOW;
+        }
+        hi = lo + CPSYCLE_ROW_WINDOW;
+    }
+
+    out->order = (uint32_t)order;
+    out->pattern = (uint32_t)pattern_index;
+    out->row = row;
+    out->window_lo = lo;
+    out->window_hi = hi;
+    return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Psycle names its own notes, including "off" and the tweak commands, in a
+// 256-entry table covering every value a cell can hold -- so the grid reads the
+// way it does in Psycle rather than in a convention invented here. The table
+// spells an empty note as spaces; the host's grid uses dots for that.
+
+static void cpsycle_format_note(char* text, size_t size, uint8_t note) {
+    const char* name = psy_dsp_notetostr(note, psy_dsp_NOTESTAB_DEFAULT);
+    if (name == nullptr || name[0] == ' ' || name[0] == '\0') {
+        snprintf(text, size, "...");
+        return;
+    }
+    snprintf(text, size, "%s", name);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Find the event on `track` at `row`, or null. Pattern entries are a list
+// ordered by beat offset, so the row is matched by rounding each offset back to
+// a row index rather than by looking a row up directly.
+
+static const psy_audio_PatternEvent* cpsycle_event_at(psy_audio_Pattern* pattern, uintptr_t lpb, uintptr_t track,
+                                                      uint32_t row) {
+    for (psy_audio_PatternNode* node = psy_audio_pattern_begin(pattern); node != nullptr; node = node->next) {
+        psy_audio_PatternEntry* entry = (psy_audio_PatternEntry*)node->entry;
+        if (entry == nullptr || entry->track != track) {
+            continue;
+        }
+
+        uint32_t entry_row = (uint32_t)((double)entry->offset * (double)lpb + 0.5);
+        if (entry_row == row) {
+            return psy_audio_patternentry_front_const(entry);
+        }
+        if (entry_row > row) {
+            // Entries are ordered by offset, so nothing later can match.
+            break;
+        }
+    }
+    return nullptr;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t cpsycle_plugin_get_cells(void* user_data, int32_t channel, uint32_t row_lo, uint32_t row_hi,
+                                         RVPatternCell* out, uint32_t cap) {
+    CpsycleReplayerData* data = (CpsycleReplayerData*)user_data;
+    if (data == nullptr || out == nullptr || channel < -1) {
+        return 0;
+    }
+
+    uintptr_t order = 0;
+    uintptr_t pattern_index = 0;
+    psy_audio_Pattern* pattern = nullptr;
+    uint32_t row = 0;
+    uint32_t rows = 0;
+    if (!cpsycle_current_location(data, &order, &pattern, &pattern_index, &row, &rows)) {
+        return 0;
+    }
+
+    uintptr_t lpb = psy_audio_sequencer_lpb(&data->player.sequencer);
+    uint32_t channels = cpsycle_pattern_channels(data);
+    if (channels == 0 || lpb == 0) {
+        return 0;
+    }
+
+    if (row_hi > rows) {
+        row_hi = rows;
+    }
+    if (row_lo >= row_hi) {
+        return 0;
+    }
+
+    uint32_t channel_start = channel < 0 ? 0 : (uint32_t)channel;
+    uint32_t channel_end = channel < 0 ? channels : (uint32_t)channel + 1;
+    if (channel_start >= channels) {
+        return 0;
+    }
+
+    uint32_t written = 0;
+    for (uint32_t r = row_lo; r < row_hi; r++) {
+        for (uint32_t c = channel_start; c < channel_end; c++) {
+            const psy_audio_PatternEvent* event = cpsycle_event_at(pattern, lpb, c, r);
+
+            for (uint32_t column = 0; column < CPSYCLE_COLUMN_COUNT; column++) {
+                if (written >= cap) {
+                    return written;
+                }
+
+                RVPatternCell* cell = &out[written++];
+                memset(cell, 0, sizeof(*cell));
+
+                char* text = (char*)cell->text;
+                size_t size = sizeof(cell->text);
+                if (event == nullptr) {
+                    snprintf(text, size, column == 0 ? "..." : "..");
+                    continue;
+                }
+
+                switch (column) {
+                    case 0:
+                        cell->raw = event->note;
+                        cpsycle_format_note(text, size, event->note);
+                        break;
+                    case 1:
+                        cell->raw = event->inst;
+                        if (event->inst == psy_audio_NOTECOMMANDS_INST_EMPTY) {
+                            snprintf(text, size, "..");
+                        } else {
+                            snprintf(text, size, "%02X", (unsigned)(event->inst & 0xFF));
+                        }
+                        break;
+                    case 2:
+                        cell->raw = event->mach;
+                        if (event->mach == psy_audio_NOTECOMMANDS_EMPTY) {
+                            snprintf(text, size, "..");
+                        } else {
+                            snprintf(text, size, "%02X", (unsigned)event->mach);
+                        }
+                        break;
+                    case 3:
+                        cell->raw = event->vol;
+                        if (event->vol == psy_audio_NOTECOMMANDS_VOL_EMPTY) {
+                            snprintf(text, size, "..");
+                        } else {
+                            snprintf(text, size, "%02X", (unsigned)(event->vol & 0xFF));
+                        }
+                        break;
+                    case 4:
+                        cell->raw = event->cmd;
+                        snprintf(text, size, "%02X", (unsigned)event->cmd);
+                        break;
+                    default:
+                        cell->raw = event->parameter;
+                        snprintf(text, size, "%02X", (unsigned)event->parameter);
+                        break;
+                }
+            }
+        }
+    }
+    return written;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static RVPlaybackPlugin g_cpsycle_plugin = {
     RV_PLAYBACK_PLUGIN_API_VERSION,
@@ -345,14 +686,15 @@ static RVPlaybackPlugin g_cpsycle_plugin = {
     nullptr, // settings_updated
     nullptr, // static_destroy
 
-    // Visualization: none (caps = 0; pure decoder, no pattern grid or scope).
-    nullptr, // get_structure
-    nullptr, // get_columns
-    nullptr, // get_pattern_channels
+    // Visualization: the tracker pattern grid. No scope -- Psycle mixes through
+    // a machine graph rather than a fixed set of channels.
+    cpsycle_plugin_get_structure,
+    cpsycle_plugin_get_columns,
+    cpsycle_plugin_get_pattern_channels,
     nullptr, // get_scope_channels
-    nullptr, // get_position
+    cpsycle_plugin_get_position,
     nullptr, // get_channel_rows
-    nullptr, // get_cells
+    cpsycle_plugin_get_cells,
     nullptr, // set_scope_enabled
     nullptr, // get_scope_samples
     nullptr, // get_vu
